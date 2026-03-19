@@ -31,6 +31,9 @@ async def lifespan(app: FastAPI):
     # Check if database exists (determine if first startup)
     is_first_startup = not db.db_exists()
 
+    # Open the persistent DB connection (shared for all runtime operations)
+    await db.connect()
+
     # Initialize database tables structure
     await db.init_db()
 
@@ -144,6 +147,8 @@ async def lifespan(app: FastAPI):
 
     # Shutdown
     print("Flow2API Shutting down...")
+    # Close the persistent DB connection
+    await db.close()
     # Stop file cache cleanup task
     await generation_handler.file_cache.stop_cleanup_task()
     # Stop auto-unban task
