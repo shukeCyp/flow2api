@@ -19,6 +19,7 @@ class TokenManager:
         self.flow_client = flow_client
         self._project_pool_size = 4
         self._active_tokens_cache_ttl = 0.5
+        self._active_tokens_stale_retry_delay = 2.0
         self._active_tokens_cache: Optional[list[Token]] = None
         self._active_tokens_cache_expires_at = 0.0
         self._async_state_guard = threading.Lock()
@@ -84,6 +85,11 @@ class TokenManager:
             and time.monotonic() < self._active_tokens_cache_expires_at
         )
 
+    def prime_active_tokens_cache(self, tokens: List[Token]):
+        """Seed the active token cache from already-loaded token rows."""
+        self._active_tokens_cache = [token for token in tokens if token.is_active]
+        self._active_tokens_cache_expires_at = time.monotonic() + self._active_tokens_cache_ttl
+
     def _sort_projects(self, projects: List[Project]) -> List[Project]:
         """Sort projects in a stable order for round-robin selection."""
         return sorted(projects, key=lambda project: (project.id or 0, project.project_id))
@@ -147,7 +153,20 @@ class TokenManager:
             if self._is_active_tokens_cache_valid():
                 return list(self._active_tokens_cache)
 
-            tokens = await self.db.get_active_tokens()
+            try:
+                tokens = await self.db.get_active_tokens()
+            except Exception as exc:
+                if self._active_tokens_cache is None:
+                    raise
+                debug_logger.log_warning(
+                    f"[TOKEN_MANAGER] Failed to refresh active tokens from database, "
+                    f"reusing stale cache for {self._active_tokens_stale_retry_delay:.1f}s: {exc}"
+                )
+                self._active_tokens_cache_expires_at = (
+                    time.monotonic() + self._active_tokens_stale_retry_delay
+                )
+                return list(self._active_tokens_cache)
+
             self._active_tokens_cache = list(tokens)
             self._active_tokens_cache_expires_at = time.monotonic() + self._active_tokens_cache_ttl
             return list(self._active_tokens_cache)

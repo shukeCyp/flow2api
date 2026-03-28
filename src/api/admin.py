@@ -1232,6 +1232,25 @@ async def clear_logs(token: str = Depends(verify_admin_token)):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.post("/api/database/cleanup")
+async def cleanup_database(token: str = Depends(verify_admin_token)):
+    """Clean disposable runtime data and reclaim SQLite space."""
+    try:
+        result = await db.cleanup_database()
+        reclaimed_mb = result["reclaimed_bytes"] / (1024 * 1024)
+        return {
+            "success": True,
+            "message": (
+                f"数据库清理完成：删除 {result['deleted_logs']} 条日志，"
+                f"删除 {result['deleted_finished_tasks']} 条已结束任务，"
+                f"回收 {reclaimed_mb:.1f} MB 空间"
+            ),
+            **result,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.get("/api/admin/config")
 async def get_admin_config(token: str = Depends(verify_admin_token)):
     """Get admin configuration"""

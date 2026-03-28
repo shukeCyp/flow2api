@@ -5,14 +5,20 @@ from src.services.token_manager import TokenManager
 
 
 class FakeDB:
-    def __init__(self, tokens, delay=0):
+    def __init__(self, tokens, delay=0, fail_after_calls=None):
         self.tokens = list(tokens)
         self.delay = delay
+        self.fail_after_calls = fail_after_calls
         self.get_active_tokens_calls = 0
         self.update_calls = []
 
     async def get_active_tokens(self):
         self.get_active_tokens_calls += 1
+        if (
+            self.fail_after_calls is not None
+            and self.get_active_tokens_calls > self.fail_after_calls
+        ):
+            raise RuntimeError("database unavailable")
         if self.delay:
             await asyncio.sleep(self.delay)
         return [token.model_copy(deep=True) for token in self.tokens if token.is_active]
@@ -89,3 +95,22 @@ def test_disable_token_invalidates_active_token_cache():
     assert second == []
     assert db.get_active_tokens_calls == 2
     assert db.update_calls == [(1, {"is_active": False})]
+
+
+def test_get_active_tokens_reuses_stale_cache_when_refresh_fails(monkeypatch):
+    clock = {"now": 100.0}
+    db = FakeDB([_token(1)], fail_after_calls=1)
+    manager = TokenManager(db, flow_client=None)
+    manager._active_tokens_cache_ttl = 0.5
+    manager._active_tokens_stale_retry_delay = 3.0
+
+    monkeypatch.setattr("src.services.token_manager.time.monotonic", lambda: clock["now"])
+
+    first = asyncio.run(manager.get_active_tokens())
+    clock["now"] += manager._active_tokens_cache_ttl + 0.01
+    second = asyncio.run(manager.get_active_tokens())
+
+    assert len(first) == 1
+    assert len(second) == 1
+    assert db.get_active_tokens_calls == 2
+    assert manager._active_tokens_cache_expires_at == clock["now"] + 3.0

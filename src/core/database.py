@@ -29,8 +29,8 @@ class Database:
         self.db_path = str(db_file)
         self._connect_timeout = 30
         self._busy_timeout_ms = 30000
-        self._connect_retries = 3
-        self._connect_retry_delay = 0.05
+        self._connect_retries = 6
+        self._connect_retry_delay = 0.1
         self._async_state_guard = threading.Lock()
         self._async_primitives_by_loop: dict[int, dict[str, Any]] = {}
         self._read_cache_state_guard = threading.RLock()
@@ -141,6 +141,45 @@ class Database:
             value = await loader()
             self._store_cached_read(cache_key, value)
             return copy.deepcopy(value)
+
+    async def get_storage_stats(self) -> Dict[str, Any]:
+        """Return lightweight SQLite file/storage stats."""
+        async with self._connect() as db:
+            page_count_cursor = await db.execute("PRAGMA page_count")
+            page_count_row = await page_count_cursor.fetchone()
+            freelist_count_cursor = await db.execute("PRAGMA freelist_count")
+            freelist_count_row = await freelist_count_cursor.fetchone()
+            page_size_cursor = await db.execute("PRAGMA page_size")
+            page_size_row = await page_size_cursor.fetchone()
+
+        page_count = int(page_count_row[0] if page_count_row else 0)
+        freelist_count = int(freelist_count_row[0] if freelist_count_row else 0)
+        page_size = int(page_size_row[0] if page_size_row else 0)
+        reclaimable_bytes = freelist_count * page_size
+        file_size_bytes = self._db_file.stat().st_size if self._db_file.exists() else 0
+        free_ratio = (freelist_count / page_count) if page_count else 0.0
+
+        return {
+            "page_count": page_count,
+            "freelist_count": freelist_count,
+            "page_size": page_size,
+            "file_size_bytes": file_size_bytes,
+            "reclaimable_bytes": reclaimable_bytes,
+            "free_ratio": free_ratio,
+        }
+
+    async def compact(self) -> Dict[str, Any]:
+        """Checkpoint WAL and rebuild the database file to reclaim free pages."""
+        before = await self.get_storage_stats()
+
+        async with self._connect(write=True) as db:
+            await db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            await db.commit()
+            await db.execute("VACUUM")
+            await db.commit()
+
+        after = await self.get_storage_stats()
+        return {"before": before, "after": after}
 
     async def _open_connection(self):
         """Open a SQLite connection with lightweight retries for burst traffic."""
@@ -1593,11 +1632,39 @@ class Database:
             row = await cursor.fetchone()
             return dict(row) if row else None
 
-    async def clear_all_logs(self):
+    async def clear_all_logs(self, *, compact: bool = False):
         """Clear all request logs"""
         async with self._connect(write=True) as db:
             await db.execute("DELETE FROM request_logs")
             await db.commit()
+        if compact:
+            await self.compact()
+
+    async def cleanup_database(self) -> Dict[str, int]:
+        """Remove disposable runtime data and compact the SQLite file."""
+        deleted_logs = 0
+        deleted_finished_tasks = 0
+
+        async with self._connect(write=True) as db:
+            log_cursor = await db.execute("DELETE FROM request_logs")
+            deleted_logs = max(0, int(log_cursor.rowcount or 0))
+
+            task_cursor = await db.execute(
+                "DELETE FROM tasks WHERE status IS NULL OR status != 'processing'"
+            )
+            deleted_finished_tasks = max(0, int(task_cursor.rowcount or 0))
+            await db.commit()
+
+        compact_result = await self.compact()
+        return {
+            "deleted_logs": deleted_logs,
+            "deleted_finished_tasks": deleted_finished_tasks,
+            "reclaimed_bytes": max(
+                0,
+                int(compact_result["before"]["file_size_bytes"])
+                - int(compact_result["after"]["file_size_bytes"]),
+            ),
+        }
 
     async def init_config_from_toml(self, config_dict: dict, is_first_startup: bool = True):
         """

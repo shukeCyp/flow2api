@@ -113,6 +113,7 @@ async def lifespan(app: FastAPI):
 
     # Initialize concurrency manager
     tokens = await token_manager.get_all_tokens()
+    token_manager.prime_active_tokens_cache(tokens)
 
     await concurrency_manager.initialize(tokens)
 
