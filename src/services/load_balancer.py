@@ -1,7 +1,8 @@
 """Load balancing module for Flow2API"""
 import asyncio
 import random
-from typing import Optional, Dict
+import threading
+from typing import Optional, Dict, Any
 from ..core.models import Token
 from ..core.config import config
 from ..core.account_tiers import (
@@ -22,12 +23,42 @@ class LoadBalancer:
         self.concurrency_manager = concurrency_manager
         self._image_pending: Dict[int, int] = {}
         self._video_pending: Dict[int, int] = {}
-        self._pending_lock = asyncio.Lock()
         self._round_robin_state: Dict[str, Optional[int]] = {"image": None, "video": None, "default": None}
-        self._rr_lock = asyncio.Lock()
+        self._async_state_guard = threading.Lock()
+        self._async_primitives_by_loop: dict[int, dict[str, Any]] = {}
+
+    def _get_async_primitives(self) -> dict[str, Any]:
+        """Return loop-local asyncio primitives for the active event loop."""
+        loop = asyncio.get_running_loop()
+        loop_id = id(loop)
+        state = self._async_primitives_by_loop.get(loop_id)
+        if state and state["loop"] is loop:
+            return state
+
+        with self._async_state_guard:
+            stale_loop_ids = [
+                existing_loop_id
+                for existing_loop_id, existing_state in self._async_primitives_by_loop.items()
+                if existing_state["loop"].is_closed()
+            ]
+            for stale_loop_id in stale_loop_ids:
+                self._async_primitives_by_loop.pop(stale_loop_id, None)
+
+            state = self._async_primitives_by_loop.get(loop_id)
+            if state and state["loop"] is loop:
+                return state
+
+            state = {
+                "loop": loop,
+                "pending_lock": asyncio.Lock(),
+                "rr_lock": asyncio.Lock(),
+            }
+            self._async_primitives_by_loop[loop_id] = state
+            return state
 
     async def _get_pending_count(self, token_id: int, for_image_generation: bool, for_video_generation: bool) -> int:
-        async with self._pending_lock:
+        pending_lock = self._get_async_primitives()["pending_lock"]
+        async with pending_lock:
             if for_image_generation:
                 return max(0, int(self._image_pending.get(token_id, 0)))
             if for_video_generation:
@@ -35,14 +66,16 @@ class LoadBalancer:
             return 0
 
     async def _add_pending(self, token_id: int, for_image_generation: bool, for_video_generation: bool):
-        async with self._pending_lock:
+        pending_lock = self._get_async_primitives()["pending_lock"]
+        async with pending_lock:
             if for_image_generation:
                 self._image_pending[token_id] = max(0, int(self._image_pending.get(token_id, 0))) + 1
             elif for_video_generation:
                 self._video_pending[token_id] = max(0, int(self._video_pending.get(token_id, 0))) + 1
 
     async def release_pending(self, token_id: int, for_image_generation: bool = False, for_video_generation: bool = False):
-        async with self._pending_lock:
+        pending_lock = self._get_async_primitives()["pending_lock"]
+        async with pending_lock:
             if for_image_generation:
                 current = max(0, int(self._image_pending.get(token_id, 0)))
                 if current <= 1:
@@ -105,7 +138,8 @@ class LoadBalancer:
             return None
 
         tokens_sorted = sorted(tokens, key=lambda item: item["token"].id or 0)
-        async with self._rr_lock:
+        rr_lock = self._get_async_primitives()["rr_lock"]
+        async with rr_lock:
             last_id = self._round_robin_state.get(scenario)
             start_idx = 0
             if last_id is not None:

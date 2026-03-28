@@ -1,7 +1,8 @@
 """Concurrency manager for token-based rate limiting"""
 import asyncio
+import threading
 import time
-from typing import Dict, Optional
+from typing import Dict, Optional, Any
 from ..core.logger import debug_logger
 
 
@@ -16,7 +17,36 @@ class ConcurrencyManager:
         # token_id -> current in-flight requests
         self._image_inflight: Dict[int, int] = {}
         self._video_inflight: Dict[int, int] = {}
-        self._lock = asyncio.Lock()  # Protect concurrent access
+        self._async_state_guard = threading.Lock()
+        self._async_primitives_by_loop: dict[int, dict[str, Any]] = {}
+
+    def _get_async_primitives(self) -> dict[str, Any]:
+        """Return loop-local asyncio primitives for the active event loop."""
+        loop = asyncio.get_running_loop()
+        loop_id = id(loop)
+        state = self._async_primitives_by_loop.get(loop_id)
+        if state and state["loop"] is loop:
+            return state
+
+        with self._async_state_guard:
+            stale_loop_ids = [
+                existing_loop_id
+                for existing_loop_id, existing_state in self._async_primitives_by_loop.items()
+                if existing_state["loop"].is_closed()
+            ]
+            for stale_loop_id in stale_loop_ids:
+                self._async_primitives_by_loop.pop(stale_loop_id, None)
+
+            state = self._async_primitives_by_loop.get(loop_id)
+            if state and state["loop"] is loop:
+                return state
+
+            state = {
+                "loop": loop,
+                "lock": asyncio.Lock(),
+            }
+            self._async_primitives_by_loop[loop_id] = state
+            return state
 
     async def initialize(self, tokens: list):
         """
@@ -25,7 +55,8 @@ class ConcurrencyManager:
         Args:
             tokens: List of Token objects with image_concurrency and video_concurrency fields
         """
-        async with self._lock:
+        lock = self._get_async_primitives()["lock"]
+        async with lock:
             self._image_limits.clear()
             self._video_limits.clear()
 
@@ -54,7 +85,8 @@ class ConcurrencyManager:
         Returns:
             True if token has available image concurrency, False if concurrency is 0
         """
-        async with self._lock:
+        lock = self._get_async_primitives()["lock"]
+        async with lock:
             limit = self._image_limits.get(token_id)
             # Missing limit means unlimited (-1)
             if limit is None:
@@ -79,7 +111,8 @@ class ConcurrencyManager:
         Returns:
             True if token has available video concurrency, False if concurrency is 0
         """
-        async with self._lock:
+        lock = self._get_async_primitives()["lock"]
+        async with lock:
             limit = self._video_limits.get(token_id)
             # Missing limit means unlimited (-1)
             if limit is None:
@@ -104,7 +137,8 @@ class ConcurrencyManager:
         Returns:
             True if acquired, False if not available
         """
-        async with self._lock:
+        lock = self._get_async_primitives()["lock"]
+        async with lock:
             limit = self._image_limits.get(token_id)
             inflight = self._image_inflight.get(token_id, 0)
 
@@ -163,7 +197,8 @@ class ConcurrencyManager:
         Returns:
             True if acquired, False if not available
         """
-        async with self._lock:
+        lock = self._get_async_primitives()["lock"]
+        async with lock:
             limit = self._video_limits.get(token_id)
             inflight = self._video_inflight.get(token_id, 0)
 
@@ -185,7 +220,8 @@ class ConcurrencyManager:
         Args:
             token_id: Token ID
         """
-        async with self._lock:
+        lock = self._get_async_primitives()["lock"]
+        async with lock:
             inflight = self._image_inflight.get(token_id, 0)
             if inflight <= 0:
                 self._image_inflight[token_id] = 0
@@ -207,7 +243,8 @@ class ConcurrencyManager:
         Args:
             token_id: Token ID
         """
-        async with self._lock:
+        lock = self._get_async_primitives()["lock"]
+        async with lock:
             inflight = self._video_inflight.get(token_id, 0)
             if inflight <= 0:
                 self._video_inflight[token_id] = 0
@@ -232,7 +269,8 @@ class ConcurrencyManager:
         Returns:
             Remaining count or None if no limit
         """
-        async with self._lock:
+        lock = self._get_async_primitives()["lock"]
+        async with lock:
             limit = self._image_limits.get(token_id)
             if limit is None:
                 return None
@@ -249,7 +287,8 @@ class ConcurrencyManager:
         Returns:
             Remaining count or None if no limit
         """
-        async with self._lock:
+        lock = self._get_async_primitives()["lock"]
+        async with lock:
             limit = self._video_limits.get(token_id)
             if limit is None:
                 return None
@@ -258,12 +297,14 @@ class ConcurrencyManager:
 
     async def get_image_inflight(self, token_id: int) -> int:
         """Get current in-flight image request count for token"""
-        async with self._lock:
+        lock = self._get_async_primitives()["lock"]
+        async with lock:
             return self._image_inflight.get(token_id, 0)
 
     async def get_video_inflight(self, token_id: int) -> int:
         """Get current in-flight video request count for token"""
-        async with self._lock:
+        lock = self._get_async_primitives()["lock"]
+        async with lock:
             return self._video_inflight.get(token_id, 0)
 
     async def reset_token(self, token_id: int, image_concurrency: int = -1, video_concurrency: int = -1):

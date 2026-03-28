@@ -2,6 +2,7 @@
 import os
 import asyncio
 import hashlib
+import threading
 import time
 import mimetypes
 from pathlib import Path
@@ -37,7 +38,36 @@ class FileCache:
         self.proxy_manager = proxy_manager
         self.flow_client = flow_client
         self._cleanup_task = None
-        self._download_locks: Dict[str, asyncio.Lock] = {}
+        self._async_state_guard = threading.Lock()
+        self._async_primitives_by_loop: dict[int, dict[str, Any]] = {}
+
+    def _get_async_primitives(self) -> dict[str, Any]:
+        """Return loop-local asyncio primitives for the active event loop."""
+        loop = asyncio.get_running_loop()
+        loop_id = id(loop)
+        state = self._async_primitives_by_loop.get(loop_id)
+        if state and state["loop"] is loop:
+            return state
+
+        with self._async_state_guard:
+            stale_loop_ids = [
+                existing_loop_id
+                for existing_loop_id, existing_state in self._async_primitives_by_loop.items()
+                if existing_state["loop"].is_closed()
+            ]
+            for stale_loop_id in stale_loop_ids:
+                self._async_primitives_by_loop.pop(stale_loop_id, None)
+
+            state = self._async_primitives_by_loop.get(loop_id)
+            if state and state["loop"] is loop:
+                return state
+
+            state = {
+                "loop": loop,
+                "download_locks": {},
+            }
+            self._async_primitives_by_loop[loop_id] = state
+            return state
 
     def _is_cleanup_disabled(self) -> bool:
         return self.default_timeout <= 0
@@ -272,7 +302,8 @@ class FileCache:
         """
         filename = self._generate_cache_filename(url, media_type)
         file_path = self.cache_dir / filename
-        download_lock = self._download_locks.setdefault(filename, asyncio.Lock())
+        download_locks = self._get_async_primitives()["download_locks"]
+        download_lock = download_locks.setdefault(filename, asyncio.Lock())
 
         async with download_lock:
             # Check if already cached and not expired

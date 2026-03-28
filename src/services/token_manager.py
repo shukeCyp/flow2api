@@ -1,8 +1,9 @@
 """Token manager for Flow2API with AT auto-refresh"""
 import asyncio
+import threading
 import time
 from datetime import datetime, timedelta, timezone
-from typing import Optional, List
+from typing import Optional, List, Any
 from ..core.database import Database
 from ..core.models import Token, Project
 from ..core.logger import debug_logger
@@ -16,14 +17,60 @@ class TokenManager:
     def __init__(self, db: Database, flow_client: FlowClient):
         self.db = db
         self.flow_client = flow_client
-        self._lock = asyncio.Lock()
-        self._project_lock = asyncio.Lock()
-        self._refresh_futures: dict[int, asyncio.Task] = {}
         self._project_pool_size = 4
         self._active_tokens_cache_ttl = 0.5
-        self._active_tokens_cache_lock = asyncio.Lock()
         self._active_tokens_cache: Optional[list[Token]] = None
         self._active_tokens_cache_expires_at = 0.0
+        self._async_state_guard = threading.Lock()
+        self._async_primitives_by_loop: dict[int, dict[str, Any]] = {}
+        self._refresh_futures_by_loop: dict[int, dict[int, asyncio.Task]] = {}
+
+    def _get_async_primitives(self) -> dict[str, Any]:
+        """Return loop-local asyncio primitives for the active event loop."""
+        loop = asyncio.get_running_loop()
+        loop_id = id(loop)
+        state = self._async_primitives_by_loop.get(loop_id)
+        if state and state["loop"] is loop:
+            return state
+
+        with self._async_state_guard:
+            stale_loop_ids = [
+                existing_loop_id
+                for existing_loop_id, existing_state in self._async_primitives_by_loop.items()
+                if existing_state["loop"].is_closed()
+            ]
+            for stale_loop_id in stale_loop_ids:
+                self._async_primitives_by_loop.pop(stale_loop_id, None)
+                self._refresh_futures_by_loop.pop(stale_loop_id, None)
+
+            state = self._async_primitives_by_loop.get(loop_id)
+            if state and state["loop"] is loop:
+                return state
+
+            state = {
+                "loop": loop,
+                "refresh_lock": asyncio.Lock(),
+                "project_lock": asyncio.Lock(),
+                "active_tokens_cache_lock": asyncio.Lock(),
+            }
+            self._async_primitives_by_loop[loop_id] = state
+            return state
+
+    def _get_loop_refresh_futures(self) -> dict[int, asyncio.Task]:
+        """Return the current loop's AT refresh task map."""
+        loop = asyncio.get_running_loop()
+        loop_id = id(loop)
+        self._get_async_primitives()
+        futures = self._refresh_futures_by_loop.get(loop_id)
+        if futures is not None:
+            return futures
+
+        with self._async_state_guard:
+            futures = self._refresh_futures_by_loop.get(loop_id)
+            if futures is None:
+                futures = {}
+                self._refresh_futures_by_loop[loop_id] = futures
+            return futures
 
     def _invalidate_active_tokens_cache(self):
         """Drop the active token cache after writes that affect token availability."""
@@ -95,7 +142,8 @@ class TokenManager:
         if self._is_active_tokens_cache_valid():
             return list(self._active_tokens_cache)
 
-        async with self._active_tokens_cache_lock:
+        active_tokens_cache_lock = self._get_async_primitives()["active_tokens_cache_lock"]
+        async with active_tokens_cache_lock:
             if self._is_active_tokens_cache_valid():
                 return list(self._active_tokens_cache)
 
@@ -355,7 +403,8 @@ class TokenManager:
 
     async def _refresh_at_inner(self, token_id: int) -> bool:
         """Perform exactly one real AT refresh attempt."""
-        async with self._lock:
+        refresh_lock = self._get_async_primitives()["refresh_lock"]
+        async with refresh_lock:
             token = await self.db.get_token(token_id)
             if not token:
                 return False
@@ -378,7 +427,8 @@ class TokenManager:
 
     async def _refresh_at(self, token_id: int) -> bool:
         """Coalesce concurrent AT refresh calls for the same token."""
-        existing_task = self._refresh_futures.get(token_id)
+        refresh_futures = self._get_loop_refresh_futures()
+        existing_task = refresh_futures.get(token_id)
         if existing_task:
             return await existing_task
 
@@ -386,12 +436,12 @@ class TokenManager:
             try:
                 return await self._refresh_at_inner(token_id)
             finally:
-                current = self._refresh_futures.get(token_id)
+                current = refresh_futures.get(token_id)
                 if current is task:
-                    self._refresh_futures.pop(token_id, None)
+                    refresh_futures.pop(token_id, None)
 
         task = asyncio.create_task(runner())
-        self._refresh_futures[token_id] = task
+        refresh_futures[token_id] = task
         return await task
 
     async def _do_refresh_at(self, token_id: int, st: str) -> bool:
@@ -505,7 +555,8 @@ class TokenManager:
 
     async def ensure_project_exists(self, token_id: int) -> str:
         """Ensure a token has a pooled set of projects and return one in round-robin order."""
-        async with self._project_lock:
+        project_lock = self._get_async_primitives()["project_lock"]
+        async with project_lock:
             token = await self.db.get_token(token_id)
             if not token:
                 raise ValueError("Token not found")

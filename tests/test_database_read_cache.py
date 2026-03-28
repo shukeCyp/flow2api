@@ -1,4 +1,5 @@
 import asyncio
+import threading
 from contextlib import asynccontextmanager
 
 from src.core.database import Database
@@ -88,3 +89,45 @@ def test_generation_config_cache_invalidates_after_update(tmp_path):
     assert third.image_timeout == 111
     assert third.video_timeout == 222
     assert counter["count"] == 3
+
+
+def test_cached_read_is_safe_across_event_loops(tmp_path):
+    db = _create_database(tmp_path)
+    first_loader_started = threading.Event()
+    release_first_loader = threading.Event()
+    loader_calls_lock = threading.Lock()
+    loader_calls = {"count": 0}
+    results = []
+    errors = []
+
+    async def loader():
+        with loader_calls_lock:
+            loader_calls["count"] += 1
+            call_number = loader_calls["count"]
+
+        if call_number == 1:
+            first_loader_started.set()
+            while not release_first_loader.is_set():
+                await asyncio.sleep(0.01)
+
+        return {"call_number": call_number}
+
+    def run_cached_read():
+        try:
+            results.append(asyncio.run(db._cached_read("cross_loop_cache_key", loader)))
+        except Exception as exc:  # pragma: no cover - exercised by the old implementation
+            errors.append(exc)
+
+    first_thread = threading.Thread(target=run_cached_read)
+    second_thread = threading.Thread(target=run_cached_read)
+
+    first_thread.start()
+    assert first_loader_started.wait(timeout=2), "first loader did not start in time"
+    second_thread.start()
+    release_first_loader.set()
+
+    first_thread.join(timeout=2)
+    second_thread.join(timeout=2)
+
+    assert not errors
+    assert len(results) == 2

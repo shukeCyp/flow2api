@@ -4,6 +4,7 @@ import aiosqlite
 import copy
 import json
 import sqlite3
+import threading
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -26,13 +27,13 @@ class Database:
 
         self._db_file = db_file
         self.db_path = str(db_file)
-        self._write_lock = asyncio.Lock()
-        self._connect_gate = asyncio.Semaphore(32)
         self._connect_timeout = 30
         self._busy_timeout_ms = 30000
         self._connect_retries = 3
         self._connect_retry_delay = 0.05
-        self._read_cache_lock = asyncio.Lock()
+        self._async_state_guard = threading.Lock()
+        self._async_primitives_by_loop: dict[int, dict[str, Any]] = {}
+        self._read_cache_state_guard = threading.RLock()
         self._read_cache: dict[str, dict[str, Any]] = {}
         self._read_cache_ttls = {
             "all_tokens_with_stats": 0.5,
@@ -47,6 +48,36 @@ class Database:
             "captcha_config": 1.0,
             "plugin_config": 1.0,
         }
+
+    def _get_async_primitives(self) -> dict[str, Any]:
+        """Return loop-local asyncio primitives for the active event loop."""
+        loop = asyncio.get_running_loop()
+        loop_id = id(loop)
+        state = self._async_primitives_by_loop.get(loop_id)
+        if state and state["loop"] is loop:
+            return state
+
+        with self._async_state_guard:
+            stale_loop_ids = [
+                existing_loop_id
+                for existing_loop_id, existing_state in self._async_primitives_by_loop.items()
+                if existing_state["loop"].is_closed()
+            ]
+            for stale_loop_id in stale_loop_ids:
+                self._async_primitives_by_loop.pop(stale_loop_id, None)
+
+            state = self._async_primitives_by_loop.get(loop_id)
+            if state and state["loop"] is loop:
+                return state
+
+            state = {
+                "loop": loop,
+                "write_lock": asyncio.Lock(),
+                "connect_gate": asyncio.Semaphore(32),
+                "read_cache_lock": asyncio.Lock(),
+            }
+            self._async_primitives_by_loop[loop_id] = state
+            return state
 
     def db_exists(self) -> bool:
         """Check if database file exists"""
@@ -68,29 +99,32 @@ class Database:
 
     def _get_cached_read(self, cache_key: str):
         """Return a defensive copy of a live cached read result if present."""
-        entry = self._read_cache.get(cache_key)
-        if not entry:
-            return None, False
-        if time.monotonic() >= entry["expires_at"]:
-            self._read_cache.pop(cache_key, None)
-            return None, False
-        return copy.deepcopy(entry["value"]), True
+        with self._read_cache_state_guard:
+            entry = self._read_cache.get(cache_key)
+            if not entry:
+                return None, False
+            if time.monotonic() >= entry["expires_at"]:
+                self._read_cache.pop(cache_key, None)
+                return None, False
+            return copy.deepcopy(entry["value"]), True
 
     def _store_cached_read(self, cache_key: str, value):
         """Store a defensive copy of a read result for a short TTL."""
         ttl = self._read_cache_ttls.get(cache_key, 0.5)
-        self._read_cache[cache_key] = {
-            "value": copy.deepcopy(value),
-            "expires_at": time.monotonic() + ttl,
-        }
+        with self._read_cache_state_guard:
+            self._read_cache[cache_key] = {
+                "value": copy.deepcopy(value),
+                "expires_at": time.monotonic() + ttl,
+            }
 
     def _invalidate_read_cache(self, *cache_keys: str):
         """Invalidate selected read caches, or all caches when no keys are given."""
-        if not cache_keys:
-            self._read_cache.clear()
-            return
-        for cache_key in cache_keys:
-            self._read_cache.pop(cache_key, None)
+        with self._read_cache_state_guard:
+            if not cache_keys:
+                self._read_cache.clear()
+                return
+            for cache_key in cache_keys:
+                self._read_cache.pop(cache_key, None)
 
     async def _cached_read(self, cache_key: str, loader):
         """Run a cached read-through query with coalesced cache misses."""
@@ -98,7 +132,8 @@ class Database:
         if found:
             return cached_value
 
-        async with self._read_cache_lock:
+        read_cache_lock = self._get_async_primitives()["read_cache_lock"]
+        async with read_cache_lock:
             cached_value, found = self._get_cached_read(cache_key)
             if found:
                 return cached_value
@@ -129,9 +164,13 @@ class Database:
     @asynccontextmanager
     async def _connect(self, *, write: bool = False):
         """Open a configured SQLite connection and optionally serialize writes."""
+        async_primitives = self._get_async_primitives()
+        write_lock = async_primitives["write_lock"]
+        connect_gate = async_primitives["connect_gate"]
+
         if write:
-            async with self._write_lock:
-                async with self._connect_gate:
+            async with write_lock:
+                async with connect_gate:
                     db = await self._open_connection()
                     try:
                         yield db
@@ -139,7 +178,7 @@ class Database:
                         await db.close()
             return
 
-        async with self._connect_gate:
+        async with connect_gate:
             db = await self._open_connection()
             try:
                 yield db
