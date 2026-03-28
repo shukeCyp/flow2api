@@ -1,7 +1,10 @@
 """Database storage layer for Flow2API"""
 import asyncio
 import aiosqlite
+import copy
 import json
+import sqlite3
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Optional, List, Dict, Any
@@ -16,35 +19,132 @@ class Database:
         if db_path is None:
             # Store database in data directory
             data_dir = Path(__file__).parent.parent.parent / "data"
-            data_dir.mkdir(exist_ok=True)
-            db_path = str(data_dir / "flow.db")
-        self.db_path = db_path
+            data_dir.mkdir(parents=True, exist_ok=True)
+            db_file = data_dir / "flow.db"
+        else:
+            db_file = Path(db_path).expanduser().resolve()
+
+        self._db_file = db_file
+        self.db_path = str(db_file)
         self._write_lock = asyncio.Lock()
+        self._connect_gate = asyncio.Semaphore(32)
         self._connect_timeout = 30
         self._busy_timeout_ms = 30000
+        self._connect_retries = 3
+        self._connect_retry_delay = 0.05
+        self._read_cache_lock = asyncio.Lock()
+        self._read_cache: dict[str, dict[str, Any]] = {}
+        self._read_cache_ttls = {
+            "all_tokens_with_stats": 0.5,
+            "dashboard_stats": 0.5,
+            "system_info_stats": 0.5,
+            "admin_config": 1.0,
+            "proxy_config": 1.0,
+            "generation_config": 1.0,
+            "call_logic_config": 1.0,
+            "cache_config": 1.0,
+            "debug_config": 1.0,
+            "captcha_config": 1.0,
+            "plugin_config": 1.0,
+        }
 
     def db_exists(self) -> bool:
         """Check if database file exists"""
-        return Path(self.db_path).exists()
+        return self._db_file.exists()
+
+    def _ensure_db_parent_dir(self):
+        """Ensure the database parent directory exists before opening SQLite."""
+        self._db_file.parent.mkdir(parents=True, exist_ok=True)
+
+    @staticmethod
+    def _is_retryable_connect_error(exc: Exception) -> bool:
+        """Return True when SQLite reported a transient open failure."""
+        return "unable to open database file" in str(exc).lower()
 
     async def _configure_connection(self, db):
         """Apply SQLite runtime settings for better concurrent behavior."""
         await db.execute(f"PRAGMA busy_timeout = {self._busy_timeout_ms}")
         await db.execute("PRAGMA foreign_keys = ON")
 
+    def _get_cached_read(self, cache_key: str):
+        """Return a defensive copy of a live cached read result if present."""
+        entry = self._read_cache.get(cache_key)
+        if not entry:
+            return None, False
+        if time.monotonic() >= entry["expires_at"]:
+            self._read_cache.pop(cache_key, None)
+            return None, False
+        return copy.deepcopy(entry["value"]), True
+
+    def _store_cached_read(self, cache_key: str, value):
+        """Store a defensive copy of a read result for a short TTL."""
+        ttl = self._read_cache_ttls.get(cache_key, 0.5)
+        self._read_cache[cache_key] = {
+            "value": copy.deepcopy(value),
+            "expires_at": time.monotonic() + ttl,
+        }
+
+    def _invalidate_read_cache(self, *cache_keys: str):
+        """Invalidate selected read caches, or all caches when no keys are given."""
+        if not cache_keys:
+            self._read_cache.clear()
+            return
+        for cache_key in cache_keys:
+            self._read_cache.pop(cache_key, None)
+
+    async def _cached_read(self, cache_key: str, loader):
+        """Run a cached read-through query with coalesced cache misses."""
+        cached_value, found = self._get_cached_read(cache_key)
+        if found:
+            return cached_value
+
+        async with self._read_cache_lock:
+            cached_value, found = self._get_cached_read(cache_key)
+            if found:
+                return cached_value
+
+            value = await loader()
+            self._store_cached_read(cache_key, value)
+            return copy.deepcopy(value)
+
+    async def _open_connection(self):
+        """Open a SQLite connection with lightweight retries for burst traffic."""
+        self._ensure_db_parent_dir()
+
+        last_exc = None
+        for attempt in range(1, self._connect_retries + 1):
+            try:
+                db = await aiosqlite.connect(self.db_path, timeout=self._connect_timeout)
+                await self._configure_connection(db)
+                return db
+            except sqlite3.OperationalError as exc:
+                last_exc = exc
+                if not self._is_retryable_connect_error(exc) or attempt >= self._connect_retries:
+                    raise
+                await asyncio.sleep(self._connect_retry_delay * attempt)
+
+        if last_exc is not None:
+            raise last_exc
+
     @asynccontextmanager
     async def _connect(self, *, write: bool = False):
         """Open a configured SQLite connection and optionally serialize writes."""
         if write:
             async with self._write_lock:
-                async with aiosqlite.connect(self.db_path, timeout=self._connect_timeout) as db:
-                    await self._configure_connection(db)
-                    yield db
+                async with self._connect_gate:
+                    db = await self._open_connection()
+                    try:
+                        yield db
+                    finally:
+                        await db.close()
             return
 
-        async with aiosqlite.connect(self.db_path, timeout=self._connect_timeout) as db:
-            await self._configure_connection(db)
-            yield db
+        async with self._connect_gate:
+            db = await self._open_connection()
+            try:
+                yield db
+            finally:
+                await db.close()
 
     async def _table_exists(self, db, table_name: str) -> bool:
         """Check if a table exists in the database"""
@@ -785,6 +885,7 @@ class Database:
             """, (token_id,))
             await db.commit()
 
+            self._invalidate_read_cache("all_tokens_with_stats", "dashboard_stats", "system_info_stats")
             return token_id
 
     async def get_token(self, token_id: int) -> Optional[Token]:
@@ -827,78 +928,87 @@ class Database:
 
     async def get_all_tokens_with_stats(self) -> List[Dict[str, Any]]:
         """Get all tokens with merged statistics in one query"""
-        async with self._connect() as db:
-            db.row_factory = aiosqlite.Row
-            cursor = await db.execute("""
-                SELECT
-                    t.*,
-                    COALESCE(ts.image_count, 0) AS image_count,
-                    COALESCE(ts.video_count, 0) AS video_count,
-                    COALESCE(ts.error_count, 0) AS error_count
-                FROM tokens t
-                LEFT JOIN token_stats ts ON ts.token_id = t.id
-                ORDER BY t.created_at DESC
-            """)
-            rows = await cursor.fetchall()
-            return [dict(row) for row in rows]
+        async def loader():
+            async with self._connect() as db:
+                db.row_factory = aiosqlite.Row
+                cursor = await db.execute("""
+                    SELECT
+                        t.*,
+                        COALESCE(ts.image_count, 0) AS image_count,
+                        COALESCE(ts.video_count, 0) AS video_count,
+                        COALESCE(ts.error_count, 0) AS error_count
+                    FROM tokens t
+                    LEFT JOIN token_stats ts ON ts.token_id = t.id
+                    ORDER BY t.created_at DESC
+                """)
+                rows = await cursor.fetchall()
+                return [dict(row) for row in rows]
+
+        return await self._cached_read("all_tokens_with_stats", loader)
 
     async def get_dashboard_stats(self) -> Dict[str, int]:
         """Get dashboard counters with aggregated SQL queries"""
-        async with self._connect() as db:
-            db.row_factory = aiosqlite.Row
+        async def loader():
+            async with self._connect() as db:
+                db.row_factory = aiosqlite.Row
 
-            token_cursor = await db.execute("""
-                SELECT
-                    COUNT(*) AS total_tokens,
-                    COALESCE(SUM(CASE WHEN is_active = 1 THEN 1 ELSE 0 END), 0) AS active_tokens
-                FROM tokens
-            """)
-            token_row = await token_cursor.fetchone()
+                token_cursor = await db.execute("""
+                    SELECT
+                        COUNT(*) AS total_tokens,
+                        COALESCE(SUM(CASE WHEN is_active = 1 THEN 1 ELSE 0 END), 0) AS active_tokens
+                    FROM tokens
+                """)
+                token_row = await token_cursor.fetchone()
 
-            stats_cursor = await db.execute("""
-                SELECT
-                    COALESCE(SUM(image_count), 0) AS total_images,
-                    COALESCE(SUM(video_count), 0) AS total_videos,
-                    COALESCE(SUM(error_count), 0) AS total_errors,
-                    COALESCE(SUM(today_image_count), 0) AS today_images,
-                    COALESCE(SUM(today_video_count), 0) AS today_videos,
-                    COALESCE(SUM(today_error_count), 0) AS today_errors
-                FROM token_stats
-            """)
-            stats_row = await stats_cursor.fetchone()
+                stats_cursor = await db.execute("""
+                    SELECT
+                        COALESCE(SUM(image_count), 0) AS total_images,
+                        COALESCE(SUM(video_count), 0) AS total_videos,
+                        COALESCE(SUM(error_count), 0) AS total_errors,
+                        COALESCE(SUM(today_image_count), 0) AS today_images,
+                        COALESCE(SUM(today_video_count), 0) AS today_videos,
+                        COALESCE(SUM(today_error_count), 0) AS today_errors
+                    FROM token_stats
+                """)
+                stats_row = await stats_cursor.fetchone()
 
-            token_data = dict(token_row) if token_row else {}
-            stats_data = dict(stats_row) if stats_row else {}
+                token_data = dict(token_row) if token_row else {}
+                stats_data = dict(stats_row) if stats_row else {}
 
-            return {
-                "total_tokens": int(token_data.get("total_tokens") or 0),
-                "active_tokens": int(token_data.get("active_tokens") or 0),
-                "total_images": int(stats_data.get("total_images") or 0),
-                "total_videos": int(stats_data.get("total_videos") or 0),
-                "total_errors": int(stats_data.get("total_errors") or 0),
-                "today_images": int(stats_data.get("today_images") or 0),
-                "today_videos": int(stats_data.get("today_videos") or 0),
-                "today_errors": int(stats_data.get("today_errors") or 0)
-            }
+                return {
+                    "total_tokens": int(token_data.get("total_tokens") or 0),
+                    "active_tokens": int(token_data.get("active_tokens") or 0),
+                    "total_images": int(stats_data.get("total_images") or 0),
+                    "total_videos": int(stats_data.get("total_videos") or 0),
+                    "total_errors": int(stats_data.get("total_errors") or 0),
+                    "today_images": int(stats_data.get("today_images") or 0),
+                    "today_videos": int(stats_data.get("today_videos") or 0),
+                    "today_errors": int(stats_data.get("today_errors") or 0)
+                }
+
+        return await self._cached_read("dashboard_stats", loader)
 
     async def get_system_info_stats(self) -> Dict[str, int]:
         """Get lightweight system counters used by admin dashboard"""
-        async with self._connect() as db:
-            db.row_factory = aiosqlite.Row
-            cursor = await db.execute("""
-                SELECT
-                    COUNT(*) AS total_tokens,
-                    COALESCE(SUM(CASE WHEN is_active = 1 THEN 1 ELSE 0 END), 0) AS active_tokens,
-                    COALESCE(SUM(CASE WHEN is_active = 1 THEN credits ELSE 0 END), 0) AS total_credits
-                FROM tokens
-            """)
-            row = await cursor.fetchone()
-            data = dict(row) if row else {}
-            return {
-                "total_tokens": int(data.get("total_tokens") or 0),
-                "active_tokens": int(data.get("active_tokens") or 0),
-                "total_credits": int(data.get("total_credits") or 0)
-            }
+        async def loader():
+            async with self._connect() as db:
+                db.row_factory = aiosqlite.Row
+                cursor = await db.execute("""
+                    SELECT
+                        COUNT(*) AS total_tokens,
+                        COALESCE(SUM(CASE WHEN is_active = 1 THEN 1 ELSE 0 END), 0) AS active_tokens,
+                        COALESCE(SUM(CASE WHEN is_active = 1 THEN credits ELSE 0 END), 0) AS total_credits
+                    FROM tokens
+                """)
+                row = await cursor.fetchone()
+                data = dict(row) if row else {}
+                return {
+                    "total_tokens": int(data.get("total_tokens") or 0),
+                    "active_tokens": int(data.get("active_tokens") or 0),
+                    "total_credits": int(data.get("total_credits") or 0)
+                }
+
+        return await self._cached_read("system_info_stats", loader)
 
     async def get_active_tokens(self) -> List[Token]:
         """Get all active tokens"""
@@ -924,6 +1034,7 @@ class Database:
                 query = f"UPDATE tokens SET {', '.join(updates)} WHERE id = ?"
                 await db.execute(query, params)
                 await db.commit()
+                self._invalidate_read_cache("all_tokens_with_stats", "dashboard_stats", "system_info_stats")
 
     async def delete_token(self, token_id: int):
         """Delete token and related data"""
@@ -932,6 +1043,7 @@ class Database:
             await db.execute("DELETE FROM projects WHERE token_id = ?", (token_id,))
             await db.execute("DELETE FROM tokens WHERE id = ?", (token_id,))
             await db.commit()
+            self._invalidate_read_cache("all_tokens_with_stats", "dashboard_stats", "system_info_stats")
 
     # Project operations
     async def add_project(self, project: Project) -> int:
@@ -1066,6 +1178,7 @@ class Database:
                     WHERE token_id = ?
                 """, (today, token_id))
             await db.commit()
+            self._invalidate_read_cache("all_tokens_with_stats", "dashboard_stats")
 
     async def increment_video_count(self, token_id: int):
         """Increment video generation count with daily reset"""
@@ -1095,6 +1208,7 @@ class Database:
                     WHERE token_id = ?
                 """, (today, token_id))
             await db.commit()
+            self._invalidate_read_cache("all_tokens_with_stats", "dashboard_stats")
 
     async def increment_error_count(self, token_id: int):
         """Increment error count with daily reset
@@ -1134,6 +1248,7 @@ class Database:
                     WHERE token_id = ?
                 """, (today, token_id))
             await db.commit()
+            self._invalidate_read_cache("all_tokens_with_stats", "dashboard_stats")
 
     async def reset_error_count(self, token_id: int):
         """Reset consecutive error count (only reset consecutive_error_count, keep error_count and today_error_count)
@@ -1153,13 +1268,16 @@ class Database:
     # Config operations
     async def get_admin_config(self) -> Optional[AdminConfig]:
         """Get admin configuration"""
-        async with self._connect() as db:
-            db.row_factory = aiosqlite.Row
-            cursor = await db.execute("SELECT * FROM admin_config WHERE id = 1")
-            row = await cursor.fetchone()
-            if row:
-                return AdminConfig(**dict(row))
-            return None
+        async def loader():
+            async with self._connect() as db:
+                db.row_factory = aiosqlite.Row
+                cursor = await db.execute("SELECT * FROM admin_config WHERE id = 1")
+                row = await cursor.fetchone()
+                if row:
+                    return AdminConfig(**dict(row))
+                return None
+
+        return await self._cached_read("admin_config", loader)
 
     async def update_admin_config(self, **kwargs):
         """Update admin configuration"""
@@ -1177,16 +1295,20 @@ class Database:
                 query = f"UPDATE admin_config SET {', '.join(updates)} WHERE id = 1"
                 await db.execute(query, params)
                 await db.commit()
+                self._invalidate_read_cache("admin_config")
 
     async def get_proxy_config(self) -> Optional[ProxyConfig]:
         """Get proxy configuration"""
-        async with self._connect() as db:
-            db.row_factory = aiosqlite.Row
-            cursor = await db.execute("SELECT * FROM proxy_config WHERE id = 1")
-            row = await cursor.fetchone()
-            if row:
-                return ProxyConfig(**dict(row))
-            return None
+        async def loader():
+            async with self._connect() as db:
+                db.row_factory = aiosqlite.Row
+                cursor = await db.execute("SELECT * FROM proxy_config WHERE id = 1")
+                row = await cursor.fetchone()
+                if row:
+                    return ProxyConfig(**dict(row))
+                return None
+
+        return await self._cached_read("proxy_config", loader)
 
     async def update_proxy_config(
         self,
@@ -1230,16 +1352,20 @@ class Database:
                 """, (enabled, proxy_url, new_media_proxy_enabled, new_media_proxy_url))
 
             await db.commit()
+            self._invalidate_read_cache("proxy_config")
 
     async def get_generation_config(self) -> Optional[GenerationConfig]:
         """Get generation configuration"""
-        async with self._connect() as db:
-            db.row_factory = aiosqlite.Row
-            cursor = await db.execute("SELECT * FROM generation_config WHERE id = 1")
-            row = await cursor.fetchone()
-            if row:
-                return GenerationConfig(**dict(row))
-            return None
+        async def loader():
+            async with self._connect() as db:
+                db.row_factory = aiosqlite.Row
+                cursor = await db.execute("SELECT * FROM generation_config WHERE id = 1")
+                row = await cursor.fetchone()
+                if row:
+                    return GenerationConfig(**dict(row))
+                return None
+
+        return await self._cached_read("generation_config", loader)
 
     async def update_generation_config(self, image_timeout: int, video_timeout: int):
         """Update generation configuration"""
@@ -1250,20 +1376,24 @@ class Database:
                 WHERE id = 1
             """, (image_timeout, video_timeout))
             await db.commit()
+            self._invalidate_read_cache("generation_config")
 
     async def get_call_logic_config(self) -> CallLogicConfig:
         """Get token call logic configuration."""
-        async with self._connect() as db:
-            db.row_factory = aiosqlite.Row
-            cursor = await db.execute("SELECT * FROM call_logic_config WHERE id = 1")
-            row = await cursor.fetchone()
-            if row:
-                row_dict = dict(row)
-                mode = row_dict.get("call_mode")
-                if mode not in ("default", "polling"):
-                    row_dict["call_mode"] = "polling" if row_dict.get("polling_mode_enabled") else "default"
-                return CallLogicConfig(**row_dict)
-            return CallLogicConfig(call_mode="default", polling_mode_enabled=False)
+        async def loader():
+            async with self._connect() as db:
+                db.row_factory = aiosqlite.Row
+                cursor = await db.execute("SELECT * FROM call_logic_config WHERE id = 1")
+                row = await cursor.fetchone()
+                if row:
+                    row_dict = dict(row)
+                    mode = row_dict.get("call_mode")
+                    if mode not in ("default", "polling"):
+                        row_dict["call_mode"] = "polling" if row_dict.get("polling_mode_enabled") else "default"
+                    return CallLogicConfig(**row_dict)
+                return CallLogicConfig(call_mode="default", polling_mode_enabled=False)
+
+        return await self._cached_read("call_logic_config", loader)
 
     async def update_call_logic_config(self, call_mode: str):
         """Update token call logic configuration."""
@@ -1275,6 +1405,7 @@ class Database:
                 VALUES (1, ?, ?, CURRENT_TIMESTAMP)
             """, (normalized, polling_mode_enabled))
             await db.commit()
+            self._invalidate_read_cache("call_logic_config")
 
     # Request log operations
     async def add_request_log(self, log: RequestLog) -> int:
@@ -1447,6 +1578,16 @@ class Database:
                 await self._ensure_config_rows(db, config_dict=None)
 
             await db.commit()
+            self._invalidate_read_cache(
+                "admin_config",
+                "proxy_config",
+                "generation_config",
+                "call_logic_config",
+                "cache_config",
+                "debug_config",
+                "captcha_config",
+                "plugin_config",
+            )
 
     async def reload_config_to_memory(self):
         """
@@ -1510,14 +1651,16 @@ class Database:
     # Cache config operations
     async def get_cache_config(self) -> CacheConfig:
         """Get cache configuration"""
-        async with self._connect() as db:
-            db.row_factory = aiosqlite.Row
-            cursor = await db.execute("SELECT * FROM cache_config WHERE id = 1")
-            row = await cursor.fetchone()
-            if row:
-                return CacheConfig(**dict(row))
-            # Return default if not found
-            return CacheConfig(cache_enabled=False, cache_timeout=7200)
+        async def loader():
+            async with self._connect() as db:
+                db.row_factory = aiosqlite.Row
+                cursor = await db.execute("SELECT * FROM cache_config WHERE id = 1")
+                row = await cursor.fetchone()
+                if row:
+                    return CacheConfig(**dict(row))
+                return CacheConfig(cache_enabled=False, cache_timeout=7200)
+
+        return await self._cached_read("cache_config", loader)
 
     async def update_cache_config(self, enabled: bool = None, timeout: int = None, base_url: Optional[str] = None):
         """Update cache configuration"""
@@ -1555,19 +1698,22 @@ class Database:
                 """, (new_enabled, new_timeout, new_base_url))
 
             await db.commit()
+            self._invalidate_read_cache("cache_config")
 
     # Debug config operations
     async def get_debug_config(self) -> 'DebugConfig':
         """Get debug configuration"""
         from .models import DebugConfig
-        async with self._connect() as db:
-            db.row_factory = aiosqlite.Row
-            cursor = await db.execute("SELECT * FROM debug_config WHERE id = 1")
-            row = await cursor.fetchone()
-            if row:
-                return DebugConfig(**dict(row))
-            # Return default if not found
-            return DebugConfig(enabled=False, log_requests=True, log_responses=True, mask_token=True)
+        async def loader():
+            async with self._connect() as db:
+                db.row_factory = aiosqlite.Row
+                cursor = await db.execute("SELECT * FROM debug_config WHERE id = 1")
+                row = await cursor.fetchone()
+                if row:
+                    return DebugConfig(**dict(row))
+                return DebugConfig(enabled=False, log_requests=True, log_responses=True, mask_token=True)
+
+        return await self._cached_read("debug_config", loader)
 
     async def update_debug_config(
         self,
@@ -1609,17 +1755,21 @@ class Database:
                 """, (new_enabled, new_log_requests, new_log_responses, new_mask_token))
 
             await db.commit()
+            self._invalidate_read_cache("debug_config")
 
     # Captcha config operations
     async def get_captcha_config(self) -> CaptchaConfig:
         """Get captcha configuration"""
-        async with self._connect() as db:
-            db.row_factory = aiosqlite.Row
-            cursor = await db.execute("SELECT * FROM captcha_config WHERE id = 1")
-            row = await cursor.fetchone()
-            if row:
-                return CaptchaConfig(**dict(row))
-            return CaptchaConfig()
+        async def loader():
+            async with self._connect() as db:
+                db.row_factory = aiosqlite.Row
+                cursor = await db.execute("SELECT * FROM captcha_config WHERE id = 1")
+                row = await cursor.fetchone()
+                if row:
+                    return CaptchaConfig(**dict(row))
+                return CaptchaConfig()
+
+        return await self._cached_read("captcha_config", loader)
 
     async def update_captcha_config(
         self,
@@ -1708,17 +1858,21 @@ class Database:
                       new_proxy_enabled, new_proxy_url, new_browser_count))
 
             await db.commit()
+            self._invalidate_read_cache("captcha_config")
 
     # Plugin config operations
     async def get_plugin_config(self) -> PluginConfig:
         """Get plugin configuration"""
-        async with self._connect() as db:
-            db.row_factory = aiosqlite.Row
-            cursor = await db.execute("SELECT * FROM plugin_config WHERE id = 1")
-            row = await cursor.fetchone()
-            if row:
-                return PluginConfig(**dict(row))
-            return PluginConfig()
+        async def loader():
+            async with self._connect() as db:
+                db.row_factory = aiosqlite.Row
+                cursor = await db.execute("SELECT * FROM plugin_config WHERE id = 1")
+                row = await cursor.fetchone()
+                if row:
+                    return PluginConfig(**dict(row))
+                return PluginConfig()
+
+        return await self._cached_read("plugin_config", loader)
 
     async def update_plugin_config(self, connection_token: str, auto_enable_on_update: bool = True):
         """Update plugin configuration"""
@@ -1740,3 +1894,4 @@ class Database:
                 """, (connection_token, auto_enable_on_update))
 
             await db.commit()
+            self._invalidate_read_cache("plugin_config")

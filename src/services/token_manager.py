@@ -1,5 +1,6 @@
 """Token manager for Flow2API with AT auto-refresh"""
 import asyncio
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Optional, List
 from ..core.database import Database
@@ -19,6 +20,22 @@ class TokenManager:
         self._project_lock = asyncio.Lock()
         self._refresh_futures: dict[int, asyncio.Task] = {}
         self._project_pool_size = 4
+        self._active_tokens_cache_ttl = 0.5
+        self._active_tokens_cache_lock = asyncio.Lock()
+        self._active_tokens_cache: Optional[list[Token]] = None
+        self._active_tokens_cache_expires_at = 0.0
+
+    def _invalidate_active_tokens_cache(self):
+        """Drop the active token cache after writes that affect token availability."""
+        self._active_tokens_cache = None
+        self._active_tokens_cache_expires_at = 0.0
+
+    def _is_active_tokens_cache_valid(self) -> bool:
+        """Return True when the active token cache can still be reused."""
+        return (
+            self._active_tokens_cache is not None
+            and time.monotonic() < self._active_tokens_cache_expires_at
+        )
 
     def _sort_projects(self, projects: List[Project]) -> List[Project]:
         """Sort projects in a stable order for round-robin selection."""
@@ -75,7 +92,17 @@ class TokenManager:
 
     async def get_active_tokens(self) -> List[Token]:
         """Get all active tokens"""
-        return await self.db.get_active_tokens()
+        if self._is_active_tokens_cache_valid():
+            return list(self._active_tokens_cache)
+
+        async with self._active_tokens_cache_lock:
+            if self._is_active_tokens_cache_valid():
+                return list(self._active_tokens_cache)
+
+            tokens = await self.db.get_active_tokens()
+            self._active_tokens_cache = list(tokens)
+            self._active_tokens_cache_expires_at = time.monotonic() + self._active_tokens_cache_ttl
+            return list(self._active_tokens_cache)
 
     async def get_token(self, token_id: int) -> Optional[Token]:
         """Get token by ID"""
@@ -84,6 +111,7 @@ class TokenManager:
     async def delete_token(self, token_id: int):
         """Delete token"""
         await self.db.delete_token(token_id)
+        self._invalidate_active_tokens_cache()
 
     async def enable_token(self, token_id: int):
         """Enable a token and reset error count"""
@@ -91,10 +119,12 @@ class TokenManager:
         await self.db.update_token(token_id, is_active=True)
         # Reset error count when enabling (only reset total error_count, keep today_error_count)
         await self.db.reset_error_count(token_id)
+        self._invalidate_active_tokens_cache()
 
     async def disable_token(self, token_id: int):
         """Disable a token"""
         await self.db.update_token(token_id, is_active=False)
+        self._invalidate_active_tokens_cache()
 
     # ========== Token添加 (支持Project创建) ==========
 
@@ -198,6 +228,7 @@ class TokenManager:
         debug_logger.log_info(
             f"[ADD_TOKEN] Token added successfully (ID: {token_id}, Email: {email}, pooled_projects={len(pooled_projects)})"
         )
+        self._invalidate_active_tokens_cache()
         return token
     async def update_token(
         self,
@@ -264,6 +295,7 @@ class TokenManager:
 
         if update_fields:
             await self.db.update_token(token_id, **update_fields)
+            self._invalidate_active_tokens_cache()
 
     # ========== AT自动刷新逻辑 (核心) ==========
 
@@ -394,6 +426,7 @@ class TokenManager:
                 at=new_at,
                 at_expires=new_at_expires
             )
+            self._invalidate_active_tokens_cache()
 
             debug_logger.log_info(f"[AT_REFRESH] Token {token_id}: AT刷新成功")
             debug_logger.log_info(f"  - 新过期时间: {new_at_expires}")
@@ -406,6 +439,7 @@ class TokenManager:
                     credits=credits_result.get("credits", 0),
                     user_paygate_tier=credits_result.get("userPaygateTier"),
                 )
+                self._invalidate_active_tokens_cache()
                 debug_logger.log_info(f"[AT_REFRESH] Token {token_id}: AT 验证成功（余额: {credits_result.get('credits', 0)}）")
                 return True
             except Exception as verify_err:
@@ -540,6 +574,7 @@ class TokenManager:
             ban_reason="429_rate_limit",
             banned_at=datetime.now(timezone.utc)
         )
+        self._invalidate_active_tokens_cache()
 
     async def auto_unban_429_tokens(self):
         """自动解禁因429被禁用的token
@@ -551,6 +586,7 @@ class TokenManager:
         """
         all_tokens = await self.db.get_all_tokens()
         now = datetime.now(timezone.utc)
+        cache_invalidated = False
 
         for token in all_tokens:
             # 跳过非429禁用的token
@@ -599,6 +635,10 @@ class TokenManager:
                 )
                 # 重置错误计数
                 await self.db.reset_error_count(token.id)
+                cache_invalidated = True
+
+        if cache_invalidated:
+            self._invalidate_active_tokens_cache()
 
     # ========== 余额刷新 ==========
 
@@ -628,6 +668,7 @@ class TokenManager:
                 credits=credits,
                 user_paygate_tier=user_paygate_tier,
             )
+            self._invalidate_active_tokens_cache()
 
             return credits
         except Exception as e:
